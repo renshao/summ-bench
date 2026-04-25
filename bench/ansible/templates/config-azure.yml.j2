@@ -8,6 +8,8 @@ storage:
     accountname: "{{ azure_storage_account }}"
     accountkey: "{{ azure_storage_key }}"
     container: "{{ azure_storage_container }}"
+    credentials:
+      type: shared_key
   cache:
     blobdescriptor: inmemory
   delete:

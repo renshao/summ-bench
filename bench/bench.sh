@@ -8,7 +8,6 @@
 #   6. Print summary, optionally destroy.
 
 set -euo pipefail
-shopt -s inherit_errexit
 
 # ---------- paths ----------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

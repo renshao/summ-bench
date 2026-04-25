@@ -16,15 +16,15 @@ variable "prefix" {
 }
 
 variable "vm_size_registry" {
-  description = "VM SKU for the registry server. Lsv3 family gives local NVMe (>= 200 GB)."
+  description = "VM SKU for the registry server. Default Ddsv5 has 300 GB local NVMe and is broadly pre-quota'd. Use Lsv3 (1.92 TB NVMe) only if you've requested quota for it."
   type        = string
-  default     = "Standard_L8s_v3"
+  default     = "Standard_D8ds_v5"
 }
 
 variable "vm_size_loadtester" {
-  description = "VM SKU for the load tester."
+  description = "VM SKU for the load tester. Default D2ds_v5 (2 vCPU / 8 GiB / 75 GiB NVMe) is plenty for HTTP-bound load gen; cargo build is ~5-7 min one-time. Same DDsv5 family as the registry, so no new quota needed."
   type        = string
-  default     = "Standard_D8s_v5"
+  default     = "Standard_D2ds_v5"
 }
 
 variable "operator_cidr" {

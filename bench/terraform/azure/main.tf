@@ -21,6 +21,12 @@ terraform {
 }
 
 provider "azurerm" {
+  # Skip the slow per-subscription RP registration probe (azurerm 4.x default).
+  # The RPs we need (Microsoft.Compute, Network, Storage) are registered on any
+  # subscription that has ever held a VM. If apply fails with an unregistered RP
+  # error, run: az provider register --namespace Microsoft.<Name>
+  resource_provider_registrations = "none"
+
   features {
     resource_group {
       prevent_deletion_if_contains_resources = false

@@ -146,3 +146,10 @@ inspected results.
 - GCP provider.
 - Concurrency sweep mode (1, 4, 16) producing a curve.
 - Compare against alternatives: Harbor, zot, Spegel.
+
+## Useful commands
+
+ssh one liner
+```
+ssh -i (terraform -chdir=bench/terraform/azure output -raw ssh_private_key_path) (terraform -chdir=bench/terraform/azure output -raw admin_username)@(terraform -chdir=bench/terraform/azure output -raw registry_public_ip)
+```
