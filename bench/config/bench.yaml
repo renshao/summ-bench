@@ -1,0 +1,22 @@
+# Reference / documentation only. The single source of truth for runtime knobs
+# is bench.sh's CLI flags + terraform/azure/terraform.tfvars. This file exists
+# so future Phase-2 work (AWS, GCP) has a place to centralize cross-provider
+# defaults without changing the entry script.
+
+azure:
+  location: eastus
+  vm_sizes:
+    registry: Standard_L8s_v3      # 8 vCPU, 64 GiB RAM, ~1.92 TB local NVMe
+    loadtester: Standard_D8s_v5    # 8 vCPU, 32 GiB RAM
+  storage:
+    account_tier: Standard
+    replication: LRS
+
+loadtest:
+  default_concurrency: 1
+  default_iterations: 1
+  default_blob_concurrency: 3      # matches containerd default
+
+corpus:
+  default: config/images.txt
+  smoke: config/images-smoke.txt

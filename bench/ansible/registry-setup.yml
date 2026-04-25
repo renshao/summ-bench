@@ -1,0 +1,180 @@
+---
+- name: Set up registry VM (NVMe + Docker + two distribution registries)
+  hosts: registry
+  become: true
+  gather_facts: true
+
+  vars:
+    nvme_mount_point: /mnt/registry-data
+
+  tasks:
+    - name: Detect local NVMe device
+      ansible.builtin.shell: |
+        set -eo pipefail
+        # Lsv3 SKUs expose local NVMe at /dev/nvme*n1 (excluding the OS disk on /dev/sda)
+        for dev in $(lsblk -dno NAME,TYPE | awk '$2=="disk" && $1 ~ /^nvme/ {print "/dev/"$1}'); do
+          if ! lsblk -no MOUNTPOINT "$dev" | grep -q '/'; then
+            echo "$dev"
+            exit 0
+          fi
+        done
+        echo "ERROR: no unmounted NVMe device found" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: nvme_detect
+      changed_when: false
+
+    - name: Set NVMe device fact
+      ansible.builtin.set_fact:
+        nvme_device: "{{ nvme_detect.stdout }}"
+
+    - name: Create ext4 filesystem on NVMe
+      community.general.filesystem:
+        fstype: ext4
+        dev: "{{ nvme_device }}"
+        opts: -E lazy_itable_init=0,lazy_journal_init=0
+      tags: [storage]
+
+    - name: Create mount point
+      ansible.builtin.file:
+        path: "{{ nvme_mount_point }}"
+        state: directory
+        mode: "0755"
+
+    - name: Mount NVMe (transient — local NVMe is wiped on dealloc anyway)
+      ansible.posix.mount:
+        path: "{{ nvme_mount_point }}"
+        src: "{{ nvme_device }}"
+        fstype: ext4
+        opts: defaults,noatime,nodiratime
+        state: mounted
+      tags: [storage]
+
+    - name: Install required apt packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - jq
+          - python3-pip
+        state: present
+        update_cache: true
+
+    - name: Add Docker apt key
+      ansible.builtin.shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker apt repo
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        mode: "0644"
+        content: |
+          deb [arch={{ ansible_architecture | replace('x86_64','amd64') | replace('aarch64','arm64') }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+
+    - name: Install Docker Engine + compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Start docker
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add admin user to docker group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+
+    - name: Install crane (go-containerregistry)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        VERSION=v0.20.2
+        ARCH=$(uname -m | sed -e 's/x86_64/x86_64/' -e 's/aarch64/arm64/')
+        OS=Linux
+        cd /tmp
+        curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${VERSION}/go-containerregistry_${OS}_${ARCH}.tar.gz" \
+          | tar xz crane
+        install -m 0755 crane /usr/local/bin/crane
+        rm -f crane
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/crane
+
+    - name: Create registry config dir
+      ansible.builtin.file:
+        path: /etc/registry
+        state: directory
+        mode: "0755"
+
+    - name: Render distribution config (filesystem)
+      ansible.builtin.template:
+        src: config-fs.yml.j2
+        dest: /etc/registry/config-fs.yml
+        mode: "0644"
+
+    - name: Render distribution config (azure)
+      ansible.builtin.template:
+        src: config-azure.yml.j2
+        dest: /etc/registry/config-azure.yml
+        mode: "0640"
+      vars:
+        azure_storage_account: "{{ storage_account_name }}"
+        azure_storage_key: "{{ storage_account_key }}"
+        azure_storage_container: "{{ registry_blob_container }}"
+
+    - name: Render docker-compose for both registries
+      ansible.builtin.template:
+        src: registry-compose.yml.j2
+        dest: /etc/registry/compose.yml
+        mode: "0644"
+
+    - name: Set permissions on registry data
+      ansible.builtin.file:
+        path: "{{ nvme_mount_point }}"
+        state: directory
+        mode: "0777"
+
+    - name: Pull registry image
+      community.docker.docker_image:
+        name: registry:3
+        source: pull
+
+    - name: Start registries via compose
+      ansible.builtin.shell: docker compose -f /etc/registry/compose.yml up -d
+      args:
+        chdir: /etc/registry
+      register: compose_up
+      changed_when: "'Started' in compose_up.stdout or 'Created' in compose_up.stdout"
+
+    - name: Wait for registry-fs (port 5000)
+      ansible.builtin.uri:
+        url: http://127.0.0.1:5000/v2/
+        status_code: [200, 401]
+      register: result
+      retries: 30
+      delay: 2
+      until: result.status in [200, 401]
+
+    - name: Wait for registry-azure (port 5001)
+      ansible.builtin.uri:
+        url: http://127.0.0.1:5001/v2/
+        status_code: [200, 401]
+      register: result
+      retries: 30
+      delay: 2
+      until: result.status in [200, 401]

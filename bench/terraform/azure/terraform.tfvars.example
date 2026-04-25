@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and edit before `terraform apply`.
+
+# Restrict SSH inbound to your public IP. Find with: curl -s ifconfig.me
+operator_cidr = "203.0.113.42/32"
+
+# Optional overrides
+# location            = "eastus"
+# prefix              = "regbench"
+# vm_size_registry    = "Standard_L8s_v3"
+# vm_size_loadtester  = "Standard_D8s_v5"

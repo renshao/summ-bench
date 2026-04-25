@@ -1,0 +1,4 @@
+# Tiny set for end-to-end pipeline validation (~150 MB total).
+alpine:3.20
+nginx:1.27-alpine
+postgres:17-alpine
