@@ -26,6 +26,11 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ -n "${CRANE_REGISTRY:-}" && -n "${CRANE_USER:-}" && -n "${CRANE_PASSWORD:-}" ]]; then
+  echo "authenticating crane with $CRANE_REGISTRY"
+  crane auth login "$CRANE_REGISTRY" -u "$CRANE_USER" -p "$CRANE_PASSWORD"
+fi
+
 results=()
 
 ref_to_repo_tag() {

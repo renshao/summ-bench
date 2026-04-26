@@ -9,4 +9,4 @@ nvcr.io/nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
 tensorflow/tensorflow:2.18.0-gpu
 vllm/vllm-openai:v0.6.4
 huggingface/transformers-pytorch-gpu:latest
-rayproject/ray-ml:2.39.0-py311-gpu
+rayproject/ray-ml:nightly-extra-py310-cpu

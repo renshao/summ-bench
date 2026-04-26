@@ -4,3 +4,6 @@
 # Claude Code — local-only files
 .claude/settings.local.json
 .claude/.credentials*
+
+# Personal notes
+notes/

@@ -29,6 +29,9 @@ BLOB_CONCURRENCY=3
 SKIP_PROVISION=false
 SKIP_POPULATE=false
 SKIP_LOADTEST=false
+CRANE_REGISTRY=""
+CRANE_USER=""
+CRANE_PASSWORD=""
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 
 usage() {
@@ -47,6 +50,9 @@ Options:
   --skip-provision          Reuse existing terraform state (skip apply)
   --skip-populate           Reuse existing registry contents (skip image mirror)
   --skip-loadtest           Run only provisioning + populate
+  --crane-registry <host>   Registry host to authenticate with crane before populating
+  --crane-user <user>       Username for crane auth login
+  --crane-password <pass>   Password for crane auth login
   -h, --help                Show this help
 EOF
 }
@@ -64,6 +70,9 @@ while [[ $# -gt 0 ]]; do
     --skip-provision)   SKIP_PROVISION=true; shift ;;
     --skip-populate)    SKIP_POPULATE=true; shift ;;
     --skip-loadtest)    SKIP_LOADTEST=true; shift ;;
+    --crane-registry)   CRANE_REGISTRY="$2"; shift 2 ;;
+    --crane-user)       CRANE_USER="$2"; shift 2 ;;
+    --crane-password)   CRANE_PASSWORD="$2"; shift 2 ;;
     -h|--help)          usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -189,7 +198,11 @@ if [[ "$SKIP_POPULATE" == false ]]; then
   log "populating registries from: $IMAGES_FILE"
   scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$SCRIPT_DIR/populate.sh" "$IMAGES_FILE" "$ADMIN@$REG_PUB:/tmp/"
-  ssh_reg "bash /tmp/populate.sh /tmp/$(basename "$IMAGES_FILE") /tmp/populate-report.json"
+  populate_env=""
+  if [[ -n "$CRANE_REGISTRY" && -n "$CRANE_USER" && -n "$CRANE_PASSWORD" ]]; then
+    populate_env="CRANE_REGISTRY=$(printf '%q' "$CRANE_REGISTRY") CRANE_USER=$(printf '%q' "$CRANE_USER") CRANE_PASSWORD=$(printf '%q' "$CRANE_PASSWORD")"
+  fi
+  ssh_reg "env $populate_env bash /tmp/populate.sh /tmp/$(basename "$IMAGES_FILE") /tmp/populate-report.json"
   scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$ADMIN@$REG_PUB:/tmp/populate-report.json" "$RUN_DIR/populate-report.json"
 fi
