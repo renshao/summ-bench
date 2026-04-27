@@ -1,0 +1,5 @@
+region         = "us-east-1"
+prefix         = "regbench"
+operator_cidr  = "YOUR_PUBLIC_IP/32"
+# instance_type_registry  = "m6id.2xlarge"   # 8 vCPU / 32 GiB / 474 GB NVMe ~$0.54/hr
+# instance_type_loadtester = "c6i.large"      # 2 vCPU / 4 GiB              ~$0.09/hr

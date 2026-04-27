@@ -1,0 +1,19 @@
+services:
+  registry-fs:
+    image: registry:3
+    container_name: registry-fs
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /etc/registry/config-fs.yml:/etc/distribution/config.yml:ro
+      - /mnt/registry-data:/mnt/registry-data
+    command: ["serve", "/etc/distribution/config.yml"]
+
+  registry-s3:
+    image: registry:3
+    container_name: registry-s3
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /etc/registry/config-s3.yml:/etc/distribution/config.yml:ro
+    command: ["serve", "/etc/distribution/config.yml"]

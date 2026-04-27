@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # bench.sh — end-to-end harness:
-#   1. Provision Azure (terraform apply).
+#   1. Provision cloud infra (terraform apply).
 #   2. Configure VMs (ansible).
 #   3. Mirror curated images into both registries.
-#   4. Run Rust load tester against fs-backed and azure-blob-backed registries.
-#   5. Pull reports back, render a combined Markdown summary, upload to blob.
+#   4. Run Rust load tester against fs-backed and blob-backed registries.
+#   5. Pull reports back, render a combined Markdown summary, upload to blob/S3.
 #   6. Print summary, optionally destroy.
 
 set -euo pipefail
 
 # ---------- paths ----------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TERRAFORM_DIR="$SCRIPT_DIR/terraform/azure"
 ANSIBLE_DIR="$SCRIPT_DIR/ansible"
 LOADTEST_DIR="$SCRIPT_DIR/loadtest"
 REPORTS_DIR="$SCRIPT_DIR/reports"
@@ -39,14 +38,14 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  --provider <azure>        Cloud provider (azure only in Phase 1; default: azure)
+  --provider <azure|aws>    Cloud provider (default: azure)
   --images <file>           Override images list (default: config/images.txt)
   --smoke                   Use config/images-smoke.txt (3 small images for fast validation)
   --concurrency <n>         Parallel image pulls in load test (default: 1)
   --iterations <n>          How many times to pull each image (default: 1)
   --blob-concurrency <n>    Per-image blob fetch fanout (default: 3)
   --destroy                 terraform destroy at end (no prompt)
-  --keep                    leave infra running after run (default)
+  --keep                    Leave infra running after run (default)
   --skip-provision          Reuse existing terraform state (skip apply)
   --skip-populate           Reuse existing registry contents (skip image mirror)
   --skip-loadtest           Run only provisioning + populate
@@ -82,10 +81,26 @@ if [[ "$SMOKE" == true ]]; then
   IMAGES_FILE="$CONFIG_DIR/images-smoke.txt"
 fi
 
-if [[ "$PROVIDER" != "azure" ]]; then
-  echo "ERROR: only azure is supported in Phase 1 (got: $PROVIDER)" >&2
+if [[ "$PROVIDER" != "azure" && "$PROVIDER" != "aws" ]]; then
+  echo "ERROR: unsupported provider '$PROVIDER'. Use azure or aws." >&2
   exit 2
 fi
+
+# ---------- provider-specific paths ----------
+case "$PROVIDER" in
+  azure)
+    TERRAFORM_DIR="$SCRIPT_DIR/terraform/azure"
+    REGISTRY_SETUP_PLAYBOOK="registry-setup.yml"
+    LOADTESTER_SETUP_PLAYBOOK="loadtester-setup.yml"
+    BLOB_SCENARIO="azure"
+    ;;
+  aws)
+    TERRAFORM_DIR="$SCRIPT_DIR/terraform/aws"
+    REGISTRY_SETUP_PLAYBOOK="registry-setup-aws.yml"
+    LOADTESTER_SETUP_PLAYBOOK="loadtester-setup-aws.yml"
+    BLOB_SCENARIO="s3"
+    ;;
+esac
 
 # ---------- prereqs ----------
 log() { printf '[bench %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -98,18 +113,28 @@ require() {
 log "checking prerequisites..."
 require terraform
 require ansible-playbook
-require az
 require jq
 require ssh
 require scp
 require rsync
 
+case "$PROVIDER" in
+  azure)
+    require az
+    if ! az account show >/dev/null 2>&1; then
+      die "az not logged in. Run 'az login' first."
+    fi
+    ;;
+  aws)
+    require aws
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+      die "aws not authenticated. Run 'aws configure' or set AWS_PROFILE / AWS_* env vars."
+    fi
+    ;;
+esac
+
 if [[ ! -f "$IMAGES_FILE" ]]; then
   die "images file not found: $IMAGES_FILE"
-fi
-
-if ! az account show >/dev/null 2>&1; then
-  die "az not logged in. Run 'az login' first."
 fi
 
 if [[ ! -f "$TERRAFORM_DIR/terraform.tfvars" && "$SKIP_PROVISION" == false ]]; then
@@ -128,7 +153,6 @@ if [[ "$SKIP_PROVISION" == false ]]; then
   terraform -chdir="$TERRAFORM_DIR" apply -input=false -auto-approve
 fi
 
-# Pull terraform outputs once and cache.
 TF_JSON="$RUN_DIR/terraform.json"
 terraform -chdir="$TERRAFORM_DIR" output -json > "$TF_JSON"
 
@@ -137,16 +161,27 @@ REG_PRIV=$(jq -r '.registry_private_ip.value' "$TF_JSON")
 LT_PUB=$(jq -r '.loadtester_public_ip.value' "$TF_JSON")
 ADMIN=$(jq -r '.admin_username.value' "$TF_JSON")
 SSH_KEY=$(jq -r '.ssh_private_key_path.value' "$TF_JSON")
-STORAGE_ACCT=$(jq -r '.storage_account_name.value' "$TF_JSON")
-STORAGE_KEY=$(jq -r '.storage_account_key.value' "$TF_JSON")
-REG_CONTAINER=$(jq -r '.registry_blob_container.value' "$TF_JSON")
-REPORTS_SAS=$(jq -r '.reports_sas_url.value' "$TF_JSON")
+
+# Provider-specific storage outputs
+case "$PROVIDER" in
+  azure)
+    STORAGE_ACCT=$(jq -r '.storage_account_name.value' "$TF_JSON")
+    STORAGE_KEY=$(jq -r '.storage_account_key.value' "$TF_JSON")
+    REG_CONTAINER=$(jq -r '.registry_blob_container.value' "$TF_JSON")
+    REPORTS_SAS=$(jq -r '.reports_sas_url.value' "$TF_JSON")
+    ;;
+  aws)
+    S3_REGISTRY_BUCKET=$(jq -r '.s3_registry_bucket.value' "$TF_JSON")
+    S3_REPORTS_BUCKET=$(jq -r '.s3_reports_bucket.value' "$TF_JSON")
+    AWS_REGION=$(jq -r '.aws_region.value' "$TF_JSON")
+    ;;
+esac
 
 log "registry  vm: $REG_PUB (private $REG_PRIV)"
 log "loadtester vm: $LT_PUB"
 
 # ---------- 2. inventory ----------
-INV="$ANSIBLE_DIR/inventory/azure.ini"
+INV="$ANSIBLE_DIR/inventory/${PROVIDER}.ini"
 mkdir -p "$ANSIBLE_DIR/inventory"
 cat > "$INV" <<EOF
 [registry]
@@ -174,14 +209,23 @@ done
 # ---------- 4. ansible ----------
 export ANSIBLE_CONFIG="$ANSIBLE_DIR/ansible.cfg"
 
-log "ansible: registry-setup.yml"
-ansible-playbook -i "$INV" "$ANSIBLE_DIR/registry-setup.yml" \
-  --extra-vars "storage_account_name=$STORAGE_ACCT" \
-  --extra-vars "storage_account_key=$STORAGE_KEY" \
-  --extra-vars "registry_blob_container=$REG_CONTAINER"
+log "ansible: $REGISTRY_SETUP_PLAYBOOK"
+case "$PROVIDER" in
+  azure)
+    ansible-playbook -i "$INV" "$ANSIBLE_DIR/$REGISTRY_SETUP_PLAYBOOK" \
+      --extra-vars "storage_account_name=$STORAGE_ACCT" \
+      --extra-vars "storage_account_key=$STORAGE_KEY" \
+      --extra-vars "registry_blob_container=$REG_CONTAINER"
+    ;;
+  aws)
+    ansible-playbook -i "$INV" "$ANSIBLE_DIR/$REGISTRY_SETUP_PLAYBOOK" \
+      --extra-vars "s3_registry_bucket=$S3_REGISTRY_BUCKET" \
+      --extra-vars "s3_bucket_region=$AWS_REGION"
+    ;;
+esac
 
-log "ansible: loadtester-setup.yml"
-ansible-playbook -i "$INV" "$ANSIBLE_DIR/loadtester-setup.yml" \
+log "ansible: $LOADTESTER_SETUP_PLAYBOOK"
+ansible-playbook -i "$INV" "$ANSIBLE_DIR/$LOADTESTER_SETUP_PLAYBOOK" \
   --extra-vars "loadtest_local_dir=$LOADTEST_DIR"
 
 # ---------- 5. populate ----------
@@ -231,9 +275,9 @@ if [[ "$SKIP_LOADTEST" == false ]]; then
   }
 
   drop_caches
-  run_scenario fs    5000 "report-fs.json"
+  run_scenario fs              5000 "report-fs.json"
   drop_caches
-  run_scenario azure 5001 "report-azure.json"
+  run_scenario "$BLOB_SCENARIO" 5001 "report-blob.json"
 fi
 
 # ---------- 7. summary ----------
@@ -242,7 +286,7 @@ log "rendering summary -> $SUMMARY_MD"
 
 render_summary() {
   local fs="$RUN_DIR/report-fs.json"
-  local az="$RUN_DIR/report-azure.json"
+  local blob="$RUN_DIR/report-blob.json"
   {
     echo "# Bench run $RUN_ID"
     echo
@@ -256,7 +300,7 @@ render_summary() {
     echo
     echo "| Scenario | pulls ok/fail | p50 | p90 | p95 | p99 | max |"
     echo "|----------|---------------|-----|-----|-----|-----|-----|"
-    for f in "$fs" "$az"; do
+    for f in "$fs" "$blob"; do
       [[ -f "$f" ]] || continue
       jq -r '
         "| \(.scenario) | \(.aggregates.successful)/\(.aggregates.failed) | \(.aggregates.duration_ms.p50 | tostring | .[0:7]) | \(.aggregates.duration_ms.p90 | tostring | .[0:7]) | \(.aggregates.duration_ms.p95 | tostring | .[0:7]) | \(.aggregates.duration_ms.p99 | tostring | .[0:7]) | \(.aggregates.duration_ms.max | tostring | .[0:7]) |"
@@ -267,7 +311,7 @@ render_summary() {
     echo
     echo "| Scenario | mean | p50 | p95 | p99 |"
     echo "|----------|------|-----|-----|-----|"
-    for f in "$fs" "$az"; do
+    for f in "$fs" "$blob"; do
       [[ -f "$f" ]] || continue
       jq -r '
         "| \(.scenario) | \(.aggregates.mb_per_sec.mean | tostring | .[0:6]) | \(.aggregates.mb_per_sec.p50 | tostring | .[0:6]) | \(.aggregates.mb_per_sec.p95 | tostring | .[0:6]) | \(.aggregates.mb_per_sec.p99 | tostring | .[0:6]) |"
@@ -279,20 +323,38 @@ render_summary() {
 render_summary
 cat "$SUMMARY_MD"
 
-# ---------- 8. upload to blob ----------
-if command -v azcopy >/dev/null 2>&1; then
-  log "uploading reports to bench-reports/$RUN_ID/"
-  base_url="${REPORTS_SAS%%\?*}"
-  qs="${REPORTS_SAS#*\?}"
-  for f in "$RUN_DIR"/*; do
-    [[ -f "$f" ]] || continue
-    base=$(basename "$f")
-    azcopy copy "$f" "${base_url}/${RUN_ID}/${base}?${qs}" >/dev/null 2>&1 \
-      || log "WARN: upload $base failed"
-  done
-else
-  log "azcopy not installed locally — skipping upload (reports kept in $RUN_DIR)"
-fi
+# ---------- 8. upload reports ----------
+case "$PROVIDER" in
+  azure)
+    if command -v azcopy >/dev/null 2>&1; then
+      log "uploading reports to bench-reports/$RUN_ID/"
+      base_url="${REPORTS_SAS%%\?*}"
+      qs="${REPORTS_SAS#*\?}"
+      for f in "$RUN_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f")
+        azcopy copy "$f" "${base_url}/${RUN_ID}/${base}?${qs}" >/dev/null 2>&1 \
+          || log "WARN: upload $base failed"
+      done
+    else
+      log "azcopy not installed locally — skipping upload (reports kept in $RUN_DIR)"
+    fi
+    ;;
+  aws)
+    if command -v aws >/dev/null 2>&1; then
+      log "uploading reports to s3://$S3_REPORTS_BUCKET/$RUN_ID/"
+      for f in "$RUN_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f")
+        aws s3 cp "$f" "s3://$S3_REPORTS_BUCKET/$RUN_ID/$base" \
+          --region "$AWS_REGION" >/dev/null 2>&1 \
+          || log "WARN: upload $base failed"
+      done
+    else
+      log "aws CLI not found — skipping upload (reports kept in $RUN_DIR)"
+    fi
+    ;;
+esac
 
 # ---------- 9. teardown ----------
 log "reports saved to: $RUN_DIR"
