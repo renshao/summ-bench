@@ -1,3 +1,3 @@
 reports/
-ansible/inventory/azure.ini
+ansible/inventory/
 config/images-*.local.txt
