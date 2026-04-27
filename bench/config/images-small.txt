@@ -1,0 +1,41 @@
+# Small-to-medium open source images for mid-range pull benchmarking.
+# Approximate compressed sizes: 30 MB – 400 MB. 20 images, ~3 GB total.
+# One ref per line. Lines starting with # and blank lines are ignored.
+
+# Base OS
+ubuntu:24.04
+debian:12-slim
+
+# Python
+python:3.13-slim
+python:3.13
+
+# Go
+golang:1.23-alpine
+golang:1.23
+
+# Node
+node:22-alpine
+node:22-slim
+
+# Ruby
+ruby:3.3-slim
+
+# JVM
+eclipse-temurin:21-jre-alpine
+eclipse-temurin:21-jdk
+
+# Databases
+redis:7.4
+postgres:17
+mysql:9.1
+mariadb:11.4
+
+# Web / proxy
+nginx:1.27
+caddy:2.9
+traefik:v3.3
+
+# Observability
+prom/prometheus:v3.1.0
+grafana/grafana:11.4.0
