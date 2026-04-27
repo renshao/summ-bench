@@ -16,11 +16,11 @@ use crate::report::{PullSample, Report};
 #[derive(Parser, Debug)]
 #[command(name = "loadtest", about = "OCI registry pull load tester")]
 struct Args {
-    /// Registry base URL, e.g. http://10.20.1.4:5000
+    /// Registry base URL, e.g. http://10.20.1.4:5000 or https://myregistry.azurecr.io
     #[arg(long)]
     target: String,
 
-    /// Scenario label recorded in the report (e.g. "fs", "azure")
+    /// Scenario label recorded in the report (e.g. "fs", "s3", "ecr")
     #[arg(long)]
     scenario: String,
 
@@ -47,6 +47,20 @@ struct Args {
     /// Optional: cap total pulls (useful for smoke runs)
     #[arg(long)]
     max_pulls: Option<usize>,
+
+    /// Path to a file with one repo:tag per line. Skips catalog discovery;
+    /// required for registries that do not support GET /v2/_catalog (e.g. ECR).
+    #[arg(long)]
+    images_file: Option<PathBuf>,
+
+    /// Username for Bearer token auth (e.g. service principal client ID for ACR,
+    /// or "AWS" for ECR with a password from `aws ecr get-login-password`)
+    #[arg(long)]
+    username: Option<String>,
+
+    /// Password / token for Bearer token auth
+    #[arg(long)]
+    password: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -62,32 +76,75 @@ async fn main() -> Result<()> {
     let started = chrono::Utc::now();
     let wall_start = Instant::now();
 
-    let client = Arc::new(RegistryClient::new(&args.target)?);
+    let credentials = match (args.username.clone(), args.password.clone()) {
+        (Some(u), Some(p)) => {
+            tracing::info!(username = %u, "using credential-based auth");
+            Some((u, p))
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("--username and --password must both be set or both omitted"),
+    };
 
-    tracing::info!(target = %args.target, "discovering catalog");
-    let catalog = client.catalog().await.context("catalog fetch failed")?;
-    tracing::info!(repo_count = catalog.len(), "catalog discovered");
+    let client = Arc::new(RegistryClient::new(&args.target, credentials)?);
 
-    let mut work: Vec<(String, String)> = Vec::new();
-    for repo in &catalog {
-        if let Some(filter) = &args.repo_filter {
-            if !repo.contains(filter) {
+    let mut work: Vec<(String, String)> = if let Some(images_path) = &args.images_file {
+        tracing::info!(path = %images_path.display(), "reading image list from file");
+        let content = tokio::fs::read_to_string(images_path)
+            .await
+            .with_context(|| format!("reading images file {}", images_path.display()))?;
+        let mut pairs = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-        }
-        let tags = match client.tags(repo).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(%repo, error = %e, "tag list failed; skipping");
-                continue;
+            // Strip a registry hostname if present (first component contains '.' or ':')
+            let without_host = strip_registry_host(line);
+            match without_host.split_once(':') {
+                Some((repo, tag)) => {
+                    let repo = repo.to_string();
+                    let tag = tag.to_string();
+                    if let Some(filter) = &args.repo_filter {
+                        if !repo.contains(filter) {
+                            continue;
+                        }
+                    }
+                    for _ in 0..args.iterations {
+                        pairs.push((repo.clone(), tag.clone()));
+                    }
+                }
+                None => {
+                    tracing::warn!(line, "skipping line: no tag (expected repo:tag)");
+                }
             }
-        };
-        for tag in tags {
-            for _ in 0..args.iterations {
-                work.push((repo.clone(), tag.clone()));
+        }
+        pairs
+    } else {
+        tracing::info!(target = %args.target, "discovering catalog");
+        let catalog = client.catalog().await.context("catalog fetch failed")?;
+        tracing::info!(repo_count = catalog.len(), "catalog discovered");
+        let mut pairs = Vec::new();
+        for repo in &catalog {
+            if let Some(filter) = &args.repo_filter {
+                if !repo.contains(filter) {
+                    continue;
+                }
+            }
+            let tags = match client.tags(repo).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(%repo, error = %e, "tag list failed; skipping");
+                    continue;
+                }
+            };
+            for tag in tags {
+                for _ in 0..args.iterations {
+                    pairs.push((repo.clone(), tag.clone()));
+                }
             }
         }
-    }
+        pairs
+    };
 
     if let Some(cap) = args.max_pulls {
         work.truncate(cap);
@@ -155,4 +212,19 @@ async fn main() -> Result<()> {
     report.print_summary();
 
     Ok(())
+}
+
+// Strips a registry hostname from an image reference if the first path component
+// looks like a hostname (contains '.' or ':', or is "localhost").
+// "nvcr.io/nvidia/cuda:12.0" -> "nvidia/cuda:12.0"
+// "ubuntu:22.04"             -> "ubuntu:22.04"   (unchanged)
+fn strip_registry_host(image: &str) -> &str {
+    // Split on '/' and check if the first component is a hostname.
+    if let Some(slash) = image.find('/') {
+        let first = &image[..slash];
+        if first.contains('.') || first.contains(':') || first == "localhost" {
+            return &image[slash + 1..];
+        }
+    }
+    image
 }

@@ -1,9 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::{self, StreamExt};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::report::PullSample;
@@ -18,6 +19,9 @@ const ACCEPT_MANIFESTS: &str = concat!(
 pub struct RegistryClient {
     http: reqwest::Client,
     base: String,
+    credentials: Option<(String, String)>,
+    // Keyed by "scope@realm" — avoids redundant token fetches across concurrent pulls.
+    token_cache: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,7 +68,7 @@ struct Descriptor {
 }
 
 impl RegistryClient {
-    pub fn new(base: &str) -> Result<Self> {
+    pub fn new(base: &str, credentials: Option<(String, String)>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .tcp_nodelay(true)
@@ -75,14 +79,84 @@ impl RegistryClient {
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_string(),
+            credentials,
+            token_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    // Sends a GET with the given headers. On a 401 Bearer challenge, fetches a
+    // token (cached per scope) and retries once. Errors on any non-2xx after retry.
+    async fn get_authed(&self, url: &str, headers: HeaderMap) -> Result<reqwest::Response> {
+        let resp = self.http.get(url).headers(headers.clone()).send().await?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp.error_for_status()?);
+        }
+        let www_auth = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let Some(www_auth) = www_auth else {
+            bail!("401 with no WWW-Authenticate from {url}");
+        };
+        tracing::debug!(%url, %www_auth, "401 challenge — fetching token");
+        let token = self.fetch_token(&www_auth).await?;
+        let mut authed = headers;
+        authed.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        Ok(self
+            .http
+            .get(url)
+            .headers(authed)
+            .send()
+            .await?
+            .error_for_status()?)
+    }
+
+    // Parses a Bearer WWW-Authenticate header, fetches a token from the auth
+    // server (with basic credentials if configured), and caches it per scope.
+    async fn fetch_token(&self, www_authenticate: &str) -> Result<String> {
+        let realm = bearer_param(www_authenticate, "realm")
+            .ok_or_else(|| anyhow!("no realm in WWW-Authenticate: {www_authenticate}"))?;
+        let service = bearer_param(www_authenticate, "service").unwrap_or_default();
+        let scope = bearer_param(www_authenticate, "scope").unwrap_or_default();
+
+        let cache_key = format!("{scope}@{realm}");
+        if let Some(tok) = self.token_cache.lock().unwrap().get(&cache_key) {
+            return Ok(tok.clone());
+        }
+
+        let mut req = self.http.get(&realm);
+        if !service.is_empty() {
+            req = req.query(&[("service", &service)]);
+        }
+        if !scope.is_empty() {
+            req = req.query(&[("scope", &scope)]);
+        }
+        if let Some((user, pass)) = &self.credentials {
+            req = req.basic_auth(user, Some(pass));
+        }
+
+        tracing::debug!(%realm, %scope, "fetching auth token");
+        let body: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+        let token = body
+            .get("token")
+            .or_else(|| body.get("access_token"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| anyhow!("no token field in auth response: {body}"))?
+            .to_string();
+
+        self.token_cache.lock().unwrap().insert(cache_key, token.clone());
+        Ok(token)
     }
 
     pub async fn catalog(&self) -> Result<Vec<String>> {
         let mut all = Vec::new();
         let mut url = format!("{}/v2/_catalog?n=1000", self.base);
         loop {
-            let resp = self.http.get(&url).send().await?.error_for_status()?;
+            let resp = self.get_authed(&url, HeaderMap::new()).await?;
             let link = resp
                 .headers()
                 .get("link")
@@ -91,9 +165,7 @@ impl RegistryClient {
             let body: CatalogResponse = resp.json().await?;
             all.extend(body.repositories);
             match next_link(link.as_deref()) {
-                Some(rel) => {
-                    url = format!("{}{}", self.base, rel);
-                }
+                Some(rel) => url = format!("{}{}", self.base, rel),
                 None => break,
             }
         }
@@ -102,7 +174,7 @@ impl RegistryClient {
 
     pub async fn tags(&self, repo: &str) -> Result<Vec<String>> {
         let url = format!("{}/v2/{}/tags/list?n=1000", self.base, repo);
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self.get_authed(&url, HeaderMap::new()).await?;
         let body: TagsResponse = resp.json().await?;
         Ok(body.tags)
     }
@@ -118,13 +190,7 @@ impl RegistryClient {
         headers.insert(ACCEPT, HeaderValue::from_static(ACCEPT_MANIFESTS));
 
         let manifest_url = format!("{}/v2/{}/manifests/{}", self.base, repo, tag);
-        let resp = self
-            .http
-            .get(&manifest_url)
-            .headers(headers.clone())
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = self.get_authed(&manifest_url, headers.clone()).await?;
 
         let media = resp
             .headers()
@@ -136,8 +202,8 @@ impl RegistryClient {
         let manifest_bytes = body_bytes.len() as u64;
 
         let image_manifest = if is_index(&media) || looks_like_index(&body_bytes) {
-            let index: ManifestIndex = serde_json::from_slice(&body_bytes)
-                .context("parsing manifest index")?;
+            let index: ManifestIndex =
+                serde_json::from_slice(&body_bytes).context("parsing manifest index")?;
             let pick = index
                 .manifests
                 .iter()
@@ -150,13 +216,7 @@ impl RegistryClient {
                 .or_else(|| index.manifests.first())
                 .ok_or_else(|| anyhow!("manifest index has no entries"))?;
             let sub_url = format!("{}/v2/{}/manifests/{}", self.base, repo, pick.digest);
-            let sub_resp = self
-                .http
-                .get(&sub_url)
-                .headers(headers)
-                .send()
-                .await?
-                .error_for_status()?;
+            let sub_resp = self.get_authed(&sub_url, headers).await?;
             let sub_body = sub_resp.bytes().await?;
             serde_json::from_slice::<ImageManifest>(&sub_body)
                 .context("parsing image manifest from index entry")?
@@ -165,7 +225,8 @@ impl RegistryClient {
                 .context("parsing image manifest")?
         };
 
-        let mut descriptors: Vec<Descriptor> = Vec::with_capacity(image_manifest.layers.len() + 1);
+        let mut descriptors: Vec<Descriptor> =
+            Vec::with_capacity(image_manifest.layers.len() + 1);
         descriptors.push(image_manifest.config);
         descriptors.extend(image_manifest.layers);
 
@@ -206,16 +267,26 @@ impl RegistryClient {
 
     async fn fetch_blob(&self, repo: &str, digest: &str) -> Result<u64> {
         let url = format!("{}/v2/{}/blobs/{}", self.base, repo, digest);
-        let mut resp = self.http.get(&url).send().await?;
-        if !resp.status().is_success() {
-            bail!("blob {} returned status {}", digest, resp.status());
-        }
+        let mut resp = self.get_authed(&url, HeaderMap::new()).await?;
         let mut total: u64 = 0;
         while let Some(chunk) = resp.chunk().await? {
             total += chunk.len() as u64;
         }
         Ok(total)
     }
+}
+
+// Parses a key="value" (or key=value) pair from a Bearer WWW-Authenticate header.
+fn bearer_param(header: &str, key: &str) -> Option<String> {
+    let header = header.strip_prefix("Bearer ")?.trim();
+    for part in header.split(',') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix(key) {
+            let val = rest.trim_start_matches('=').trim_matches('"');
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 fn is_index(media_type: &str) -> bool {
