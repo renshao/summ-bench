@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "The registry of benchmarkable engines — the single source of truth.",
+    "An engine is one registry process under test: an implementation, a storage",
+    "backend, a port, and a data directory. bench.sh reads this with jq and the",
+    "ansible playbook reads it with from_json, so a new engine is added here and",
+    "nowhere else.",
+    "",
+    "kind              implementation that serves it; picks the ansible role",
+    "storage           where blobs land: fs (local NVMe) | azure | s3",
+    "port              listen port, distinct per engine so a stray process is",
+    "                  always attributable to one engine",
+    "option            engine-specific knob. For summ this is the metadata engine",
+    "                  (summ serve --engine). Empty for distribution, whose backend",
+    "                  is chosen by the rendered config file instead.",
+    "requires_provider cloud provider the engine needs, if any. Naming one that",
+    "                  does not match --provider is an error, not a silent skip:",
+    "                  a summary missing a row is a result nobody questions."
+  ],
+
+  "distribution_version": "3.1.1",
+  "registry_data_root": "/mnt/registry-data",
+  "default_engines": ["distribution", "summ-rocks"],
+  "default_baseline": "distribution",
+
+  "engines": {
+    "distribution": {
+      "kind": "distribution",
+      "storage": "fs",
+      "port": 5000,
+      "option": "",
+      "label": "distribution (filesystem)"
+    },
+    "summ-rocks": {
+      "kind": "summ",
+      "storage": "fs",
+      "port": 5010,
+      "option": "rocks",
+      "label": "summ (RocksDB meta, filesystem blobs)"
+    },
+    "summ-redb": {
+      "kind": "summ",
+      "storage": "fs",
+      "port": 5011,
+      "option": "redb",
+      "label": "summ (redb meta, filesystem blobs)"
+    },
+    "distribution-azure": {
+      "kind": "distribution",
+      "storage": "azure",
+      "port": 5001,
+      "option": "",
+      "label": "distribution (Azure Blob)",
+      "requires_provider": "azure"
+    },
+    "distribution-s3": {
+      "kind": "distribution",
+      "storage": "s3",
+      "port": 5002,
+      "option": "",
+      "label": "distribution (S3)",
+      "requires_provider": "aws"
+    }
+  }
+}
