@@ -43,11 +43,14 @@
     dest: "{{ summ_remote_dir }}/"
     delete: true
     rsync_opts:
-      # target/ is excluded from the transfer but NOT deleted on the remote:
-      # it is the build cache that keeps a repeat run from recompiling RocksDB.
+      # An excluded path is also protected from --delete (rsync only removes
+      # excluded files under --delete-excluded, which synchronize never passes).
+      # So this both keeps target/ off the wire and leaves the remote build
+      # cache intact — which is what saves a repeat run from recompiling
+      # RocksDB. An explicit protect filter is redundant, and the long-form
+      # rule is not portable across the rsync on the controller.
       - "--exclude=target"
       - "--exclude=.git"
-      - "--filter=protect target"
   when: summ_engines | length > 0
 
 - name: Build summ in release mode

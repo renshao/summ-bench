@@ -38,9 +38,10 @@
         dest: "{{ loadtest_remote_dir }}/"
         delete: true
         rsync_opts:
+          # Excluding a path also protects it from --delete, so the remote
+          # build cache survives while staying off the wire.
           - "--exclude=target"
           - "--exclude=Cargo.lock"
-          - "--filter=protect target"
 
     - name: Build loadtest in release mode
       ansible.builtin.shell: |
