@@ -4,6 +4,15 @@
 # under systemd so the runtimes are symmetric, and crane is a static binary that
 # needs no daemon.
 
+- name: Create the registry config directory
+  # Owned by tooling, not by either engine role: both write here (rendered
+  # configs, and the .version files recording what was built), and a run that
+  # selects only summ engines skips the distribution role entirely.
+  ansible.builtin.file:
+    path: /etc/bench-registry
+    state: directory
+    mode: "0755"
+
 - name: Install base packages
   ansible.builtin.apt:
     name:
