@@ -1,174 +1,174 @@
-# bench/ — container registry pull-speed benchmark
+# bench/ — container registry implementation benchmark
 
-End-to-end harness that provisions cloud VMs, deploys two
-`distribution/distribution` registry instances on the same VM (one
-filesystem-backed on local NVMe, one blob-storage-backed), mirrors a curated
-set of public ML/CUDA images into both, and runs a Rust load tester from a
-separate VM in the same region. Output: per-pull p50/p90/p95/p99 latencies and
-per-pull throughput (MB/s).
+End-to-end harness that provisions a cloud VM, installs several container
+registry **implementations** on it, mirrors an identical image corpus into each,
+then pulls from one implementation at a time and compares them. Output:
+per-pull p50/p90/p95/p99 latency, per-pull throughput (MB/s), and a speedup
+column against a chosen baseline.
 
-Both **Azure** (Azure Blob storage driver) and **AWS** (S3 storage driver) are
-supported. Select with `--provider azure|aws` (default: `azure`).
+The comparison axis is the registry software. Every engine runs on the same VM,
+against the same local NVMe, one at a time, over a byte-identical image list —
+so a difference in the numbers is a difference in the registry.
+
+Both **Azure** and **AWS** are supported. Select with `--provider azure|aws`
+(default: `azure`).
+
+## Engines
+
+An *engine* is one registry process under test. The catalog lives in
+`config/engines.json` and is the single source of truth — `bench.sh`,
+`populate.sh` and the Ansible playbook all read it, so a new engine is added in
+exactly one place.
+
+| Engine | Implementation | Storage | Port | In default set |
+|--------|----------------|---------|------|----------------|
+| `distribution` | distribution/distribution (Go) | local NVMe | 5000 | yes |
+| `summ-rocks` | summ (Rust), RocksDB metadata | local NVMe | 5010 | yes |
+| `summ-redb` | summ (Rust), redb metadata | local NVMe | 5011 | no |
+| `distribution-azure` | distribution/distribution | Azure Blob | 5001 | no |
+| `distribution-s3` | distribution/distribution | S3 | 5002 | no |
+
+`distribution-azure` and `distribution-s3` are the original storage-backend
+comparison, kept but out of the default set: storage backend and registry
+implementation are independent variables, and mixing them in one table makes
+neither readable. Benchmark them deliberately:
+
+```bash
+./bench.sh --provider aws --engines distribution,distribution-s3
+```
+
+`summ` is built from your **local working tree** (`--summ-src`, default
+`../summ`), not from a git ref, so a run measures work in progress. The exact
+revision — with a `-dirty` marker — is recorded in every report.
+
+```bash
+./bench.sh --list-engines
+```
+
+## Running
+
+```bash
+# Smoke run — 3 small images, validates the whole pipeline
+./bench.sh --smoke
+
+# The headline comparison
+./bench.sh --engines distribution,summ-rocks --iterations 3 --concurrency 4
+
+# Three interleaved rounds; the per-round table shows whether the VM held steady
+./bench.sh --smoke --rounds 3
+
+# Both summ metadata engines against the baseline
+./bench.sh --engines distribution,summ-rocks,summ-redb
+
+# Reuse existing infra and registry contents
+./bench.sh --skip-provision --skip-populate
+
+# Tear down afterwards
+./bench.sh --destroy
+```
+
+Output lands in `reports/<YYYYMMDD-HHMMSS>/`:
+
+| File | Contents |
+|------|----------|
+| `summary.md` | The comparison tables |
+| `report-<engine>-r<round>.json` | One load-test run: aggregates plus every raw sample |
+| `populate-report.json` | Per-engine push durations from the mirror phase |
+| `engines-selected.json` | The resolved engine specs this run used |
+| `terraform.json` | Infrastructure outputs, with sensitive values redacted |
+
+## What keeps the comparison honest
+
+A head-to-head number is only worth reading if the two sides ran under the same
+conditions. The harness enforces that:
+
+- **One engine runs at a time.** Every engine is a systemd unit, installed
+  disabled. `bench.sh` stops all of them and starts exactly one per scenario, so
+  the engine under test never shares CPU or page cache with an idle competitor.
+- **Both run natively.** No containers. Comparing a host process against a
+  containerised one folds cgroup limits and an overlay filesystem into the
+  measurement of only one side.
+- **Same disk.** Every engine's data directory is `/mnt/registry-data/<engine>`
+  on the same local NVMe.
+- **Identical pull set and order.** All scenarios read the same `--images-file`
+  rather than discovering each registry's catalog. Catalog ordering is
+  implementation-defined, and a different order is a different benchmark.
+- **Cold every time.** The engine is restarted before each scenario (resetting
+  distribution's blob descriptor cache and summ's RocksDB block cache) and the
+  page cache is dropped after it starts.
+- **Round-robin rounds.** `--rounds N` interleaves engines A,B,A,B rather than
+  A,A,B,B, so a machine that drifts slower over the run penalises both engines
+  evenly. Percentiles are pooled from raw samples across rounds — the mean of
+  two p95s is not the p95 of the union.
+- **Attributable.** Each report records the engine build measured: a summ git
+  revision or a distribution release tag.
 
 ## Layout
 
 ```
 bench/
-  bench.sh                    # single entry point
-  populate.sh                 # runs on registry VM (image mirror via crane)
+  bench.sh                      # single entry point, all phases
+  populate.sh                   # runs on the registry VM (image mirror via crane)
   config/
-    images.txt                # curated public ML/CUDA refs (default corpus)
-    images-smoke.txt          # 3 small images for fast pipeline validation
-  terraform/
-    azure/                    # azurerm Terraform module
-    aws/                      # AWS Terraform module (EC2, VPC, S3)
+    engines.json                # THE engine catalog — add engines here
+    images.txt                  # curated public ML/CUDA refs (default corpus)
+    images-smoke.txt            # 3 small images for fast validation
+  loadtest/                     # Rust load tester (containerd-shaped pull)
   ansible/
-    registry-setup.yml        # Docker, NVMe, distribution v3 (×2 ports) — Azure
-    registry-setup-aws.yml    # same, S3 storage driver — AWS
-    loadtester-setup.yml      # Rust toolchain, build loadtest — Azure
-    loadtester-setup-aws.yml  # same — AWS
-    templates/                # distribution config + docker-compose
-  loadtest/                   # Rust crate (tokio + reqwest)
-  reports/                    # written by bench.sh on each run
+    registry-setup.yml          # one playbook, every provider and engine
+    loadtester-setup.yml
+    tasks/verify-engine.yml     # start, health-check, stop — per engine
+    roles/
+      local_disk/               # NVMe detect, format, mount at /mnt
+      tooling/                  # base packages + crane
+      distribution/             # release binary, config + unit per engine
+      summ/                     # rsync source, cargo build, unit per engine
+  terraform/azure/ , terraform/aws/
+  reports/<run-id>/
 ```
 
-## Prerequisites (operator workstation)
+## Flags
 
-- `terraform` (>= 1.6) or `tofu`
-- `ansible` (>= 9) with `community.docker`, `ansible.posix`, `community.general` collections
-- Cloud CLI: `az` (Azure, signed in via `az login`) **or** `aws` (AWS, configured via `aws configure` or `AWS_PROFILE`/`AWS_*` env vars)
-- `jq`, `ssh`, `scp`, `rsync`
+Run `./bench.sh --help` for the full list. The ones that shape a comparison:
 
-Install ansible collections:
-
-```
-ansible-galaxy collection install community.docker ansible.posix community.general
-```
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--engines <a,b,...>` | `distribution,summ-rocks` | Which implementations to compare |
+| `--baseline <engine>` | `distribution` | What the speedup column divides by |
+| `--rounds <n>` | `1` | Interleaved repeats of the whole sweep |
+| `--summ-src <path>` | `../summ` | Local summ working tree to build |
+| `--iterations <n>` | `1` | Pulls per image within one scenario |
+| `--concurrency <n>` | `1` | Parallel image pulls |
+| `--blob-concurrency <n>` | `3` | Per-image blob fanout (containerd's default) |
 
 ## One-time setup
 
-### Azure
-
 ```bash
-cd bench/terraform/azure
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars: set operator_cidr to YOUR_PUBLIC_IP/32
-# (curl -s ifconfig.me)
-```
-
-### AWS
-
-```bash
-cd bench/terraform/aws
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars: set operator_cidr to YOUR_PUBLIC_IP/32
-# AWS auth: aws configure  OR  set AWS_PROFILE / AWS_* env vars
-```
-
-## Running
-
-Smoke run (alpine/nginx/postgres, end-to-end in ~5 min):
-
-```bash
-# Azure (default)
-./bench/bench.sh --smoke
+# Azure
+cd terraform/azure && cp terraform.tfvars.example terraform.tfvars
+# set operator_cidr = "YOUR_PUBLIC_IP/32"   (curl -s ifconfig.me)
+# auth: az login
 
 # AWS
-./bench/bench.sh --provider aws --smoke
+cd terraform/aws && cp terraform.tfvars.example terraform.tfvars
+# set operator_cidr = "YOUR_PUBLIC_IP/32"
+# auth: aws configure, or AWS_PROFILE / AWS_* env vars
 ```
 
-Real run with the curated ML corpus:
+The first run that includes a summ engine compiles RocksDB from source on the
+VM (~10 min). It is cached across runs; `--skip-provision` skips it entirely.
+
+## Managed registries
+
+`--managed-registry <host>` benchmarks a hosted registry (ACR, ECR, ...)
+instead of provisioning engines. Image refs are rewritten to the target host and
+registry setup and populate are skipped.
 
 ```bash
-./bench/bench.sh
-./bench/bench.sh --provider aws
+./bench.sh --managed-registry myreg.azurecr.io \
+           --registry-user <client-id> --registry-password <secret>
 ```
 
-Useful flags:
-
-- `--provider azure|aws` — cloud provider (default: `azure`)
-- `--concurrency 4` — pull 4 images in parallel (default sequential)
-- `--iterations 3` — pull each (repo, tag) 3 times (more samples for percentiles)
-- `--destroy` — terraform destroy after the run (default: leave running)
-- `--skip-provision` — reuse existing terraform state, skip apply
-- `--skip-populate` — registry already has images; skip mirror
-- `--skip-loadtest` — only provision + populate
-- `--crane-registry / --crane-user / --crane-password` — Docker Hub auth for crane (avoids rate limits)
-
-## What gets measured
-
-Per-pull (one repo:tag):
-
-1. Start clock.
-2. `GET /v2/<repo>/manifests/<tag>` — accept all standard manifest types.
-3. If image index → fetch `linux/amd64` sub-manifest by digest.
-4. Concurrently fetch all blobs (config + layers) — drain bodies into a sink, no
-   disk write, no decompression. Default per-image fanout: 3 (containerd default).
-5. Stop clock when last byte received.
-
-Aggregates: min / p50 / p90 / p95 / p99 / max / mean for both per-pull duration
-(ms) and per-pull throughput (MB/s), success/fail counts, total bytes, total
-wall-clock.
-
-## Two scenarios
-
-The harness runs the load tester twice against two distribution instances
-co-located on the same VM, with OS page cache dropped between runs:
-
-- `fs`    — `:5000`, `storage.filesystem` driver on local NVMe
-- `azure` / `s3` — `:5001`, blob storage driver (Azure Blob or S3 depending on `--provider`)
-
-Why same VM: the load tester is the client; the bottleneck is registry+storage
-reads and the link between the two VMs. Co-locating both registries lets us
-reuse one image population and avoid skew from two slightly different VMs.
-
-## Outputs
-
-After a run:
-
-```
-bench/reports/<run-id>/
-  terraform.json              # captured terraform outputs
-  populate-report.json        # which images were mirrored, durations, sizes
-  report-fs.json              # full per-pull samples + aggregates (FS scenario)
-  report-blob.json            # ditto, blob storage scenario (Azure or S3)
-  summary.md                  # combined Markdown table
-```
-
-## Infrastructure defaults
-
-| Provider | Registry VM | Load tester VM |
-|----------|-------------|----------------|
-| Azure | `Standard_L8s_v3` — 8 vCPU, 64 GiB RAM, ~1.92 TB NVMe | `Standard_D8s_v5` — 8 vCPU, 32 GiB RAM |
-| AWS | `m6id.2xlarge` — 8 vCPU, 32 GiB RAM, 474 GB NVMe instance store | `c6i.large` — 2 vCPU, 4 GiB RAM |
-
-## Cost
-
-**Azure:** `Standard_L8s_v3` (~$0.70/hr in eastus) + `Standard_D8s_v5` (~$0.40/hr) + trivial storage.
-
-**AWS:** `m6id.2xlarge` (~$0.54/hr in us-east-1) + `c6i.large` (~$0.09/hr) + S3 storage (negligible).
-
-A 1-hour run is dollars, not tens of dollars. The default is `--keep` (leave infra up after run); use `--destroy` once you've inspected results.
-
-## Troubleshooting
-
-- **`terraform apply` complains about quotas (Azure)**: `Standard_L8s_v3` and the Premium SSD it uses have regional vCPU quotas; switch region or request a quota increase.
-- **Crane copy from Docker Hub fails with 429**: anonymous Docker Hub rate limit. Use `--crane-registry registry-1.docker.io --crane-user <user> --crane-password <token>`, or replace offending images in `config/images.txt` with mirrors.
-- **Registry container OOMs on multi-GB pushes**: bump VM SKU; the registry uses a goroutine per upload but still buffers manifest content.
-- **NVMe device not found (Azure)**: confirm the VM SKU is Lsv3 family. DSv5 etc. don't have local NVMe.
-- **NVMe device not found (AWS)**: confirm the instance type has an instance store (e.g. `m6id`, `i3en`). `c6i` / `m6i` do not.
-- **AWS auth failure**: run `aws sts get-caller-identity` to verify credentials before running the harness.
-
-## Useful commands
-
-SSH into registry VM (Azure):
-```bash
-ssh -i (terraform -chdir=bench/terraform/azure output -raw ssh_private_key_path) \
-    (terraform -chdir=bench/terraform/azure output -raw admin_username)@(terraform -chdir=bench/terraform/azure output -raw registry_public_ip)
-```
-
-SSH into registry VM (AWS):
-```bash
-ssh -i (terraform -chdir=bench/terraform/aws output -raw ssh_private_key_path) \
-    (terraform -chdir=bench/terraform/aws output -raw admin_username)@(terraform -chdir=bench/terraform/aws output -raw registry_public_ip)
-```
+Note this is *not* an apples-to-apples comparison with the self-hosted engines:
+different hardware, different network path, and a cold local cache. It answers
+"how fast is my managed registry", not "which implementation is faster".
