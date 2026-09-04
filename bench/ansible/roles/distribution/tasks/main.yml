@@ -55,7 +55,7 @@
 - name: Render a config per distribution engine
   ansible.builtin.template:
     src: config.yml.j2
-    dest: "/etc/bench-registry/{{ item.name }}.yml"
+    dest: "/etc/bench-registry/{{ engine.name }}.yml"
     mode: "0644"
   loop: "{{ distribution_engines }}"
   loop_control:
@@ -79,6 +79,8 @@
 - name: Leave every distribution engine stopped and disabled
   # bench.sh starts exactly one engine at a time. An engine left running would
   # compete for CPU and page cache with whichever engine is under test.
+  # Tagged so the rest of this role can be exercised without a real systemd.
+  tags: [systemd]
   ansible.builtin.systemd:
     name: "{{ engine.unit }}"
     state: stopped
