@@ -1,0 +1,19 @@
+[Unit]
+Description=Benchmark registry: {{ engine.label }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ ansible_user }}
+Environment=SUMM_LOG=summ=info,summ_server=warn
+ExecStart=/usr/local/bin/summ serve \
+    --listen 0.0.0.0:{{ engine.port }} \
+    --data-dir {{ engine.data_dir }} \
+    --engine {{ engine.option }}
+Restart=no
+# Never restart on failure — see the distribution unit for why.
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

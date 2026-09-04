@@ -1,0 +1,32 @@
+---
+# Packages and standalone binaries every registry VM needs, whatever engines are
+# selected. Docker is deliberately absent: both implementations now run natively
+# under systemd so the runtimes are symmetric, and crane is a static binary that
+# needs no daemon.
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - jq
+      - bc
+    state: present
+    update_cache: true
+
+- name: Install crane (go-containerregistry)
+  # The mirror tool used by populate.sh. Pinned: an unpinned tool version is one
+  # more thing that can change between two runs being compared.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    VERSION=v0.20.2
+    ARCH=$(uname -m | sed -e 's/x86_64/x86_64/' -e 's/aarch64/arm64/')
+    OS=Linux
+    cd /tmp
+    curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${VERSION}/go-containerregistry_${OS}_${ARCH}.tar.gz" \
+      | tar xz crane
+    install -m 0755 crane /usr/local/bin/crane
+    rm -f crane
+  args:
+    executable: /bin/bash
+    creates: /usr/local/bin/crane

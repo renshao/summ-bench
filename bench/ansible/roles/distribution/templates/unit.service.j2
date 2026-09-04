@@ -1,0 +1,17 @@
+[Unit]
+Description=Benchmark registry: {{ engine.label }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ ansible_user }}
+ExecStart=/usr/local/bin/registry serve /etc/bench-registry/{{ engine.name }}.yml
+Restart=no
+# Never restart on failure. A crash mid-run must surface as failed pulls in the
+# report, not be papered over by a silent respawn that reports healthy numbers
+# from a registry that just lost its page cache.
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+---
+# Start one engine, confirm it answers on /v2/, then stop it again.
+# Called per engine from registry-setup.yml.
+
+- name: "Start {{ engine.name }}"
+  ansible.builtin.systemd:
+    name: "{{ engine.unit }}"
+    state: started
+
+- name: "Wait for {{ engine.name }} on :{{ engine.port }}"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ engine.port }}/v2/"
+    status_code: [200, 401]
+  register: engine_health
+  retries: 30
+  delay: 2
+  until: engine_health.status in [200, 401]
+
+- name: "Stop {{ engine.name }} again"
+  # Provisioning leaves nothing running. bench.sh owns which engine is up.
+  ansible.builtin.systemd:
+    name: "{{ engine.unit }}"
+    state: stopped
