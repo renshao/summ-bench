@@ -27,7 +27,17 @@
     cd "$(mktemp -d)"
     curl -fsSL -O "${BASE}/${TARBALL}"
     curl -fsSL -O "${BASE}/${TARBALL}.sha256"
-    sha256sum -c "${TARBALL}.sha256"
+    # The published .sha256 is a bare digest with no file name, which
+    # `sha256sum -c` rejects outright. Take the first field of each side so
+    # this works whether or not upstream ever adds the name back.
+    expected=$(awk '{print $1}' "${TARBALL}.sha256")
+    actual=$(sha256sum "${TARBALL}" | awk '{print $1}')
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+      echo "ERROR: checksum mismatch for ${TARBALL}" >&2
+      echo "  expected: ${expected:-<empty>}" >&2
+      echo "  actual:   ${actual}" >&2
+      exit 1
+    fi
     tar xzf "${TARBALL}" registry
     install -m 0755 registry /usr/local/bin/registry
   args:
