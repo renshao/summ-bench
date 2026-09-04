@@ -1,223 +1,53 @@
 ---
-- name: Set up registry VM (NVMe + Docker + two distribution registries)
+# Registry VM setup, one playbook for every provider and every engine.
+#
+# This replaces the former registry-setup.yml / registry-setup-aws.yml pair,
+# which were ~90% identical and duplicated the disk-detection block verbatim.
+# The provider now only affects which storage credentials are passed through to
+# a cloud-backed distribution config; everything else is common.
+#
+# `selected_engines` arrives fully resolved from bench.sh (via
+# --extra-vars @engines-selected.json), so the engine table in
+# config/engines.json is read in exactly one place and this playbook stays a
+# dumb consumer of the result. Each entry carries:
+#   name, kind, storage, port, option, label, data_dir, unit
+- name: Set up the registry VM
   hosts: registry
   become: true
   gather_facts: true
 
   vars:
-    registry_data_dir: /mnt/registry-data
+    summ_remote_dir: "/home/{{ ansible_user }}/summ-src"
 
-  tasks:
-    - name: Detect local high-performance disk
-      # Two cases handled:
-      #   "premount"      -> /mnt is already a large mount (Azure D*ds_v5: agent
-      #                      auto-mounts the local SSD at /mnt). Reuse it; just
-      #                      drop a registry-data subdir.
-      #   "format:<dev>"  -> A large unmounted block device is present (Lsv3:
-      #                      raw NVMe). We format ext4 and mount it at /mnt.
-      ansible.builtin.shell: |
-        set -euo pipefail
-        # Case 1: /mnt is already a mount of a large (>=100GB) disk.
-        if findmnt -n /mnt >/dev/null 2>&1; then
-          size_gb=$(df --output=size -BG /mnt | tail -n1 | tr -d ' G')
-          if [ "$size_gb" -ge 100 ]; then
-            echo premount
-            exit 0
-          fi
-        fi
-        # Case 2: unmounted NVMe (Lsv3 family).
-        for dev in $(lsblk -dno NAME,TYPE | awk '$2=="disk" && $1 ~ /^nvme/ {print "/dev/"$1}'); do
-          if ! lsblk -no MOUNTPOINTS "$dev" 2>/dev/null | grep -q '/' \
-             && ! lsblk -no MOUNTPOINT "$dev" | grep -q '/'; then
-            echo "format:$dev"
-            exit 0
-          fi
-        done
-        # Case 3: unmounted non-root SCSI disk.
-        ROOT_SRC=$(findmnt -n -o SOURCE /)
-        ROOT_PARENT=$(lsblk -no pkname "$ROOT_SRC" | head -n1)
-        for name in $(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}'); do
-          [ "$name" = "$ROOT_PARENT" ] && continue
-          dev="/dev/$name"
-          if lsblk -no MOUNTPOINTS "$dev" 2>/dev/null | grep -q '/'; then continue; fi
-          if lsblk -no MOUNTPOINT  "$dev" | grep -q '/'; then continue; fi
-          echo "format:$dev"
-          exit 0
-        done
-        echo "ERROR: no suitable local disk found" >&2
-        exit 1
-      args:
-        executable: /bin/bash
-      register: disk_detect
-      changed_when: false
+  pre_tasks:
+    - name: Require a resolved engine list
+      # Fail loudly rather than provisioning a VM with no registry on it.
+      ansible.builtin.assert:
+        that:
+          - selected_engines is defined
+          - selected_engines | length > 0
+        fail_msg: >-
+          selected_engines is empty. bench.sh must pass
+          --extra-vars @<run-dir>/engines-selected.json
 
-    - name: Parse disk detection result
-      ansible.builtin.set_fact:
-        disk_mode: "{{ disk_detect.stdout.split(':')[0] }}"
-        disk_device: "{{ (disk_detect.stdout.split(':') | length > 1) | ternary(disk_detect.stdout.split(':')[1], '') }}"
-
-    - name: Show storage layout decision
+    - name: Show the engines being provisioned
       ansible.builtin.debug:
-        msg: "disk_mode={{ disk_mode }} disk_device={{ disk_device }}"
+        msg: "{{ selected_engines | map(attribute='name') | join(', ') }}"
 
-    - name: Format ext4 on raw disk
-      community.general.filesystem:
-        fstype: ext4
-        dev: "{{ disk_device }}"
-        opts: -E lazy_itable_init=0,lazy_journal_init=0
-      when: disk_mode == 'format'
-      tags: [storage]
+  roles:
+    - local_disk
+    - tooling
+    - role: distribution
+      when: selected_engines | selectattr('kind', 'eq', 'distribution') | list | length > 0
+    - role: summ
+      when: selected_engines | selectattr('kind', 'eq', 'summ') | list | length > 0
 
-    - name: Mount raw disk at /mnt
-      ansible.posix.mount:
-        path: /mnt
-        src: "{{ disk_device }}"
-        fstype: ext4
-        opts: defaults,noatime,nodiratime
-        state: mounted
-      when: disk_mode == 'format'
-      tags: [storage]
-
-    - name: Ensure registry data dir exists on local disk
-      ansible.builtin.file:
-        path: "{{ registry_data_dir }}"
-        state: directory
-        mode: "0777"
-
-    - name: Install required apt packages
-      ansible.builtin.apt:
-        name:
-          - ca-certificates
-          - curl
-          - gnupg
-          - jq
-          - python3-pip
-        state: present
-        update_cache: true
-
-    - name: Add Docker apt key
-      ansible.builtin.shell: |
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        chmod a+r /etc/apt/keyrings/docker.gpg
-      args:
-        creates: /etc/apt/keyrings/docker.gpg
-
-    - name: Add Docker apt repo
-      ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/docker.list
-        mode: "0644"
-        content: |
-          deb [arch={{ ansible_architecture | replace('x86_64','amd64') | replace('aarch64','arm64') }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
-
-    - name: Install Docker Engine + compose plugin
-      ansible.builtin.apt:
-        name:
-          - docker-ce
-          - docker-ce-cli
-          - containerd.io
-          - docker-buildx-plugin
-          - docker-compose-plugin
-        state: present
-        update_cache: true
-
-    - name: Start docker
-      ansible.builtin.systemd:
-        name: docker
-        state: started
-        enabled: true
-
-    - name: Add admin user to docker group
-      ansible.builtin.user:
-        name: "{{ ansible_user }}"
-        groups: docker
-        append: true
-
-    - name: Install crane (go-containerregistry)
-      ansible.builtin.shell: |
-        set -euo pipefail
-        VERSION=v0.20.2
-        ARCH=$(uname -m | sed -e 's/x86_64/x86_64/' -e 's/aarch64/arm64/')
-        OS=Linux
-        cd /tmp
-        curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${VERSION}/go-containerregistry_${OS}_${ARCH}.tar.gz" \
-          | tar xz crane
-        install -m 0755 crane /usr/local/bin/crane
-        rm -f crane
-      args:
-        executable: /bin/bash
-        creates: /usr/local/bin/crane
-
-    - name: Create registry config dir
-      ansible.builtin.file:
-        path: /etc/registry
-        state: directory
-        mode: "0755"
-
-    - name: Render distribution config (filesystem)
-      ansible.builtin.template:
-        src: config-fs.yml.j2
-        dest: /etc/registry/config-fs.yml
-        mode: "0644"
-      notify: restart registry-fs
-
-    - name: Render distribution config (azure)
-      ansible.builtin.template:
-        src: config-azure.yml.j2
-        dest: /etc/registry/config-azure.yml
-        mode: "0640"
-      vars:
-        azure_storage_account: "{{ storage_account_name }}"
-        azure_storage_key: "{{ storage_account_key }}"
-        azure_storage_container: "{{ registry_blob_container }}"
-      notify: restart registry-azure
-
-    - name: Render docker-compose for both registries
-      ansible.builtin.template:
-        src: registry-compose.yml.j2
-        dest: /etc/registry/compose.yml
-        mode: "0644"
-
-    - name: Pull registry image
-      community.docker.docker_image:
-        name: registry:3
-        source: pull
-
-    - name: Start registries via compose
-      ansible.builtin.shell: docker compose -f /etc/registry/compose.yml up -d
-      args:
-        chdir: /etc/registry
-      register: compose_up
-      changed_when: "'Started' in compose_up.stdout or 'Created' in compose_up.stdout"
-
-    - name: Apply pending config changes (force flush handlers before health checks)
-      ansible.builtin.meta: flush_handlers
-
-    - name: Wait for registry-fs (port 5000)
-      ansible.builtin.uri:
-        url: http://127.0.0.1:5000/v2/
-        status_code: [200, 401]
-      register: result
-      retries: 30
-      delay: 2
-      until: result.status in [200, 401]
-
-    - name: Wait for registry-azure (port 5001)
-      ansible.builtin.uri:
-        url: http://127.0.0.1:5001/v2/
-        status_code: [200, 401]
-      register: result
-      retries: 30
-      delay: 2
-      until: result.status in [200, 401]
-
-  handlers:
-    - name: restart registry-fs
-      ansible.builtin.shell: docker compose -f /etc/registry/compose.yml up -d --force-recreate registry-fs
-      args:
-        chdir: /etc/registry
-
-    - name: restart registry-azure
-      ansible.builtin.shell: docker compose -f /etc/registry/compose.yml up -d --force-recreate registry-azure
-      args:
-        chdir: /etc/registry
+  post_tasks:
+    # Each engine is started once here purely to prove it serves /v2/. A broken
+    # engine must fail at provision time, not halfway through a paid benchmark.
+    - name: Verify each engine serves /v2/
+      ansible.builtin.include_tasks: tasks/verify-engine.yml
+      loop: "{{ selected_engines }}"
+      loop_control:
+        loop_var: engine
+        label: "{{ engine.name }} (:{{ engine.port }})"

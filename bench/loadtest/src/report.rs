@@ -59,6 +59,16 @@ pub struct Report {
     pub concurrency: usize,
     pub blob_concurrency: usize,
     pub iterations: usize,
+    /// Human-readable engine name, e.g. "summ (RocksDB meta, filesystem blobs)".
+    /// Distinct from `scenario`, which is the short id used in file names.
+    pub engine_label: Option<String>,
+    /// What was actually built and measured: a summ git revision or a
+    /// distribution release tag. A report without it cannot be attributed to
+    /// specific code, which makes it useless the moment either side changes.
+    pub engine_version: Option<String>,
+    /// Which sweep of the engine list produced this report. Reports from one
+    /// engine are pooled across rounds by the summary.
+    pub round: usize,
     pub aggregates: Aggregator,
     pub samples: Vec<PullSample>,
 }
@@ -75,7 +85,10 @@ impl Report {
         println!("================ load test summary ================");
         println!("scenario:           {}", self.scenario);
         println!("target:             {}", self.target);
-        println!("concurrency:        {} pulls (blob fanout {})", self.concurrency, self.blob_concurrency);
+        println!(
+            "concurrency:        {} pulls (blob fanout {})",
+            self.concurrency, self.blob_concurrency
+        );
         println!("iterations/image:   {}", self.iterations);
         println!("wall clock:         {:.1}s", self.wall_clock_seconds);
         println!("pulls (ok/fail):    {}/{}", a.successful, a.failed);

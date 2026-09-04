@@ -1,4 +1,7 @@
 ---
+# Load tester VM setup: Rust toolchain plus a release build of the loadtest
+# crate. One playbook for every provider — the azure and aws variants differed
+# only in whether azcopy was installed.
 - name: Set up load tester VM (Rust toolchain + build loadtest binary)
   hosts: loadtester
   become: false
@@ -35,6 +38,8 @@
         dest: "{{ loadtest_remote_dir }}/"
         delete: true
         rsync_opts:
+          # Excluding a path also protects it from --delete, so the remote
+          # build cache survives while staying off the wire.
           - "--exclude=target"
           - "--exclude=Cargo.lock"
 
@@ -50,6 +55,8 @@
       changed_when: "'Compiling' in cargo_build.stderr or 'Compiling' in cargo_build.stdout"
 
     - name: Install azcopy
+      # Azure only, and only for ad-hoc use from the load tester; bench.sh
+      # uploads reports with the workstation's own azcopy.
       become: true
       ansible.builtin.shell: |
         set -euo pipefail
@@ -60,3 +67,4 @@
       args:
         executable: /bin/bash
         creates: /usr/local/bin/azcopy
+      when: cloud | default('azure') == 'azure'

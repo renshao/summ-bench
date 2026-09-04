@@ -1,0 +1,48 @@
+{#
+  One distribution config per engine. The storage block is the only part that
+  varies, so the three former templates (config-fs / config-azure / config-s3)
+  collapse to this switch — port, service name and root directory all come from
+  the engine spec in config/engines.json.
+#}
+version: 0.1
+log:
+  level: info
+  fields:
+    service: {{ engine.name }}
+storage:
+{% if engine.storage == 'fs' %}
+  filesystem:
+    rootdirectory: {{ engine.data_dir }}
+    maxthreads: 100
+{% elif engine.storage == 'azure' %}
+  azure:
+    accountname: "{{ azure_storage_account }}"
+    accountkey: "{{ azure_storage_key }}"
+    container: "{{ azure_storage_container }}"
+    credentials:
+      type: shared_key
+{% elif engine.storage == 's3' %}
+  s3:
+    region: "{{ s3_region }}"
+    bucket: "{{ s3_bucket }}"
+    # No accesskey/secretkey: uses the EC2 IAM instance profile via instance metadata.
+    encrypt: false
+    secure: true
+    v4auth: true
+    chunksize: 5242880
+{% endif %}
+  cache:
+    blobdescriptor: inmemory
+  delete:
+    enabled: true
+http:
+  addr: :{{ engine.port }}
+  headers:
+    X-Content-Type-Options: [nosniff]
+  http2:
+    disabled: false
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3

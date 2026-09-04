@@ -1,0 +1,91 @@
+---
+# Install distribution/distribution natively and render one systemd unit per
+# selected distribution engine.
+#
+# Native, not a container: summ runs as a host process, so distribution must too.
+# A container comparison would fold cgroup limits and an overlay filesystem into
+# the measurement of only one side.
+
+- name: Select the distribution engines for this run
+  ansible.builtin.set_fact:
+    distribution_engines: "{{ selected_engines | selectattr('kind', 'eq', 'distribution') | list }}"
+
+- name: Download and verify the distribution release
+  # The published .sha256 is checked before the binary is unpacked. This runs on
+  # a fresh VM over the public internet; an unverified tarball is an unnecessary
+  # trust of the transport.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    VERSION="{{ distribution_version }}"
+    case "$(uname -m)" in
+      x86_64)  ARCH=amd64 ;;
+      aarch64) ARCH=arm64 ;;
+      *) echo "ERROR: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+    esac
+    BASE="https://github.com/distribution/distribution/releases/download/v${VERSION}"
+    TARBALL="registry_${VERSION}_linux_${ARCH}.tar.gz"
+    cd "$(mktemp -d)"
+    curl -fsSL -O "${BASE}/${TARBALL}"
+    curl -fsSL -O "${BASE}/${TARBALL}.sha256"
+    # The published .sha256 is a bare digest with no file name, which
+    # `sha256sum -c` rejects outright. Take the first field of each side so
+    # this works whether or not upstream ever adds the name back.
+    expected=$(awk '{print $1}' "${TARBALL}.sha256")
+    actual=$(sha256sum "${TARBALL}" | awk '{print $1}')
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+      echo "ERROR: checksum mismatch for ${TARBALL}" >&2
+      echo "  expected: ${expected:-<empty>}" >&2
+      echo "  actual:   ${actual}" >&2
+      exit 1
+    fi
+    tar xzf "${TARBALL}" registry
+    install -m 0755 registry /usr/local/bin/registry
+  args:
+    executable: /bin/bash
+    creates: /usr/local/bin/registry
+  when: distribution_engines | length > 0
+
+- name: Record the installed distribution version
+  ansible.builtin.copy:
+    dest: /etc/bench-registry/distribution.version
+    content: "{{ distribution_version }}\n"
+    mode: "0644"
+  when: distribution_engines | length > 0
+
+- name: Render a config per distribution engine
+  ansible.builtin.template:
+    src: config.yml.j2
+    dest: "/etc/bench-registry/{{ engine.name }}.yml"
+    mode: "0644"
+  loop: "{{ distribution_engines }}"
+  loop_control:
+    loop_var: engine
+    label: "{{ engine.name }} (:{{ engine.port }}, {{ engine.storage }})"
+
+- name: Render a systemd unit per distribution engine
+  ansible.builtin.template:
+    src: unit.service.j2
+    dest: "/etc/systemd/system/{{ engine.unit }}"
+    mode: "0644"
+  loop: "{{ distribution_engines }}"
+  loop_control:
+    loop_var: engine
+    label: "{{ engine.unit }}"
+  notify: reload systemd
+
+- name: Apply unit changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Leave every distribution engine stopped and disabled
+  # bench.sh starts exactly one engine at a time. An engine left running would
+  # compete for CPU and page cache with whichever engine is under test.
+  # Tagged so the rest of this role can be exercised without a real systemd.
+  tags: [systemd]
+  ansible.builtin.systemd:
+    name: "{{ engine.unit }}"
+    state: stopped
+    enabled: false
+  loop: "{{ distribution_engines }}"
+  loop_control:
+    loop_var: engine
+    label: "{{ engine.unit }}"

@@ -1,0 +1,81 @@
+---
+# Find the VM's local high-performance disk and mount it at /mnt.
+#
+# Every engine's data lives on this one device, which is what makes an
+# implementation comparison meaningful: the disk is a constant, so a difference
+# in pull throughput is a difference in the registry, not in storage placement.
+
+- name: Detect local high-performance disk
+  # Azure L8s_v3 exposes the NVMe as an unmounted device; AWS m6id.2xlarge has
+  # /dev/nvme0n1 as the EBS root and /dev/nvme1n1 as the 474 GB instance store.
+  # The three cases below cover both, plus images that pre-mount /mnt.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    # Case 1: /mnt is already a large (>=100 GB) mount.
+    if findmnt -n /mnt >/dev/null 2>&1; then
+      size_gb=$(df --output=size -BG /mnt | tail -n1 | tr -d ' G')
+      if [ "$size_gb" -ge 100 ]; then
+        echo premount
+        exit 0
+      fi
+    fi
+    # Case 2: unmounted NVMe device (instance store).
+    for dev in $(lsblk -dno NAME,TYPE | awk '$2=="disk" && $1 ~ /^nvme/ {print "/dev/"$1}'); do
+      if ! lsblk -no MOUNTPOINTS "$dev" 2>/dev/null | grep -q '/' \
+         && ! lsblk -no MOUNTPOINT "$dev" | grep -q '/'; then
+        echo "format:$dev"
+        exit 0
+      fi
+    done
+    # Case 3: unmounted non-root SCSI disk.
+    ROOT_SRC=$(findmnt -n -o SOURCE /)
+    ROOT_PARENT=$(lsblk -no pkname "$ROOT_SRC" | head -n1)
+    for name in $(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}'); do
+      [ "$name" = "$ROOT_PARENT" ] && continue
+      dev="/dev/$name"
+      if lsblk -no MOUNTPOINTS "$dev" 2>/dev/null | grep -q '/'; then continue; fi
+      if lsblk -no MOUNTPOINT  "$dev" | grep -q '/'; then continue; fi
+      echo "format:$dev"
+      exit 0
+    done
+    echo "ERROR: no suitable local disk found" >&2
+    exit 1
+  args:
+    executable: /bin/bash
+  register: disk_detect
+  changed_when: false
+
+- name: Parse disk detection result
+  ansible.builtin.set_fact:
+    disk_mode: "{{ disk_detect.stdout.split(':')[0] }}"
+    disk_device: "{{ (disk_detect.stdout.split(':') | length > 1) | ternary(disk_detect.stdout.split(':')[1], '') }}"
+
+- name: Show storage layout decision
+  ansible.builtin.debug:
+    msg: "disk_mode={{ disk_mode }} disk_device={{ disk_device }}"
+
+- name: Format ext4 on raw disk
+  community.general.filesystem:
+    fstype: ext4
+    dev: "{{ disk_device }}"
+    opts: -E lazy_itable_init=0,lazy_journal_init=0
+  when: disk_mode == 'format'
+
+- name: Mount raw disk at /mnt
+  ansible.posix.mount:
+    path: /mnt
+    src: "{{ disk_device }}"
+    fstype: ext4
+    opts: defaults,noatime,nodiratime
+    state: mounted
+  when: disk_mode == 'format'
+
+- name: Ensure per-engine data directories exist on the local disk
+  ansible.builtin.file:
+    path: "{{ item.data_dir }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    mode: "0755"
+  loop: "{{ selected_engines }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ item.data_dir }}"

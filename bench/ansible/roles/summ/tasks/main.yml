@@ -1,0 +1,110 @@
+---
+# Build summ from the operator's working tree and render one systemd unit per
+# selected summ engine.
+#
+# The source is rsync'd rather than cloned so a run measures work in progress,
+# which is the point during development. summ_src_rev records what was actually
+# built, so a report is attributable to specific code.
+
+- name: Select the summ engines for this run
+  ansible.builtin.set_fact:
+    summ_engines: "{{ selected_engines | selectattr('kind', 'eq', 'summ') | list }}"
+
+- name: Install summ build prerequisites
+  # clang and lld are what librocksdb-sys needs: it compiles RocksDB from source
+  # and runs bindgen. This mirrors summ's own CI (.github/workflows/ci.yml).
+  become: true
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - clang
+      - lld
+      - pkg-config
+      - libssl-dev
+    state: present
+    update_cache: true
+  when: summ_engines | length > 0
+
+- name: Install rustup
+  become: false
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal
+  args:
+    executable: /bin/bash
+    creates: "/home/{{ ansible_user }}/.cargo/bin/cargo"
+  when: summ_engines | length > 0
+
+- name: Sync the summ source tree to the VM
+  become: false
+  ansible.posix.synchronize:
+    src: "{{ summ_src }}/"
+    dest: "{{ summ_remote_dir }}/"
+    delete: true
+    rsync_opts:
+      # An excluded path is also protected from --delete (rsync only removes
+      # excluded files under --delete-excluded, which synchronize never passes).
+      # So this both keeps target/ off the wire and leaves the remote build
+      # cache intact — which is what saves a repeat run from recompiling
+      # RocksDB. An explicit protect filter is redundant, and the long-form
+      # rule is not portable across the rsync on the controller.
+      - "--exclude=target"
+      - "--exclude=.git"
+  when: summ_engines | length > 0
+
+- name: Build summ in release mode
+  become: false
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export PATH="$HOME/.cargo/bin:$PATH"
+    cargo build --release -p summ-server
+  args:
+    chdir: "{{ summ_remote_dir }}"
+    executable: /bin/bash
+  register: summ_build
+  changed_when: "'Compiling' in summ_build.stderr or 'Compiling' in summ_build.stdout"
+  when: summ_engines | length > 0
+
+- name: Install the summ binary
+  become: true
+  ansible.builtin.copy:
+    src: "{{ summ_remote_dir }}/target/release/summ"
+    dest: /usr/local/bin/summ
+    remote_src: true
+    mode: "0755"
+  when: summ_engines | length > 0
+
+- name: Record the summ revision that was built
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/bench-registry/summ.version
+    content: "{{ summ_src_rev }}\n"
+    mode: "0644"
+  when: summ_engines | length > 0
+
+- name: Render a systemd unit per summ engine
+  become: true
+  ansible.builtin.template:
+    src: unit.service.j2
+    dest: "/etc/systemd/system/{{ engine.unit }}"
+    mode: "0644"
+  loop: "{{ summ_engines }}"
+  loop_control:
+    loop_var: engine
+    label: "{{ engine.unit }}"
+  notify: reload systemd
+
+- name: Apply unit changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Leave every summ engine stopped and disabled
+  become: true
+  ansible.builtin.systemd:
+    name: "{{ engine.unit }}"
+    state: stopped
+    enabled: false
+  loop: "{{ summ_engines }}"
+  loop_control:
+    loop_var: engine
+    label: "{{ engine.unit }}"
