@@ -148,7 +148,10 @@ impl RegistryClient {
             .ok_or_else(|| anyhow!("no token field in auth response: {body}"))?
             .to_string();
 
-        self.token_cache.lock().unwrap().insert(cache_key, token.clone());
+        self.token_cache
+            .lock()
+            .unwrap()
+            .insert(cache_key, token.clone());
         Ok(token)
     }
 
@@ -225,8 +228,7 @@ impl RegistryClient {
                 .context("parsing image manifest")?
         };
 
-        let mut descriptors: Vec<Descriptor> =
-            Vec::with_capacity(image_manifest.layers.len() + 1);
+        let mut descriptors: Vec<Descriptor> = Vec::with_capacity(image_manifest.layers.len() + 1);
         descriptors.push(image_manifest.config);
         descriptors.extend(image_manifest.layers);
 

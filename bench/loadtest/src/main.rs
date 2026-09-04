@@ -20,9 +20,22 @@ struct Args {
     #[arg(long)]
     target: String,
 
-    /// Scenario label recorded in the report (e.g. "fs", "s3", "ecr")
+    /// Scenario label recorded in the report. This is the engine id and is used
+    /// in the report file name (e.g. "distribution", "summ-rocks", "ecr").
     #[arg(long)]
     scenario: String,
+
+    /// Human-readable engine name for the summary table.
+    #[arg(long)]
+    engine_label: Option<String>,
+
+    /// Engine build under test: a summ git revision or a distribution release tag.
+    #[arg(long)]
+    engine_version: Option<String>,
+
+    /// Which sweep of the engine list this run belongs to.
+    #[arg(long, default_value_t = 1)]
+    round: usize,
 
     /// Number of concurrent image pulls
     #[arg(long, default_value_t = 1)]
@@ -198,6 +211,9 @@ async fn main() -> Result<()> {
         concurrency: args.concurrency,
         blob_concurrency: args.blob_concurrency,
         iterations: args.iterations,
+        engine_label: args.engine_label.clone(),
+        engine_version: args.engine_version.clone(),
+        round: args.round,
         aggregates: agg,
         samples,
     };
